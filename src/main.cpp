@@ -79,7 +79,7 @@ namespace Interval {
 namespace SoilCfg {
   constexpr int   ADC_DRY            = 3100; // raw reading in dry air
   constexpr int   ADC_WET            = 1000; // raw reading fully submerged
-  constexpr int   MOISTURE_THRESHOLD = 30;   // % below which irrigation may trigger
+  constexpr int   MOISTURE_THRESHOLD = 40;   // % below which irrigation may trigger
   constexpr int   SAMPLE_COUNT       = 20;   // averaged analogRead samples per reading
   constexpr int   HISTORY_SIZE       = 3;    // samples used for the moving average
 }
@@ -98,7 +98,7 @@ namespace Safety {
   // Minimum time between two auto-irrigation triggers. Soil moisture takes
   // minutes to rise after watering, so without this the relay could
   // chatter on/off repeatedly right after a cycle finishes.
-  constexpr unsigned long IRRIGATION_COOLDOWN_MS = 10UL * 60UL * 1000UL; // 10 min
+  constexpr unsigned long IRRIGATION_COOLDOWN_MS = 10000; // 10detik
 
   // Self-restart on a schedule as a safety net against slow, hard-to-spot
   // heap leaks — common practice for devices that run unattended for
