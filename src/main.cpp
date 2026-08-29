@@ -69,7 +69,7 @@ namespace Interval {
   constexpr unsigned long SEND_DATA  = 5000;
   constexpr unsigned long SOIL_CHECK = 1000;
   constexpr unsigned long ENV_CHECK  = 4000;
-  constexpr unsigned long RELAY_ON   = 2000;
+  constexpr unsigned long RELAY_ON   = 4000;
   constexpr unsigned long WIFI_RETRY = 10000; // how often to retry a dropped connection
 }
 
@@ -77,9 +77,9 @@ namespace Interval {
 // Soil / irrigation configuration
 // ---------------------------------------------------------------------
 namespace SoilCfg {
-  constexpr int   ADC_DRY            = 3100; // raw reading in dry air
+  constexpr int   ADC_DRY            = 2500; // raw reading in dry air
   constexpr int   ADC_WET            = 1000; // raw reading fully submerged
-  constexpr int   MOISTURE_THRESHOLD = 40;   // % below which irrigation may trigger
+  constexpr int   MOISTURE_THRESHOLD = 60;   // % below which irrigation may trigger
   constexpr int   SAMPLE_COUNT       = 20;   // averaged analogRead samples per reading
   constexpr int   HISTORY_SIZE       = 3;    // samples used for the moving average
 }
@@ -98,7 +98,7 @@ namespace Safety {
   // Minimum time between two auto-irrigation triggers. Soil moisture takes
   // minutes to rise after watering, so without this the relay could
   // chatter on/off repeatedly right after a cycle finishes.
-  constexpr unsigned long IRRIGATION_COOLDOWN_MS = 10000; // 10detik
+  constexpr unsigned long IRRIGATION_COOLDOWN_MS = 60UL * 1000UL; // 60 detik
 
   // Self-restart on a schedule as a safety net against slow, hard-to-spot
   // heap leaks — common practice for devices that run unattended for
@@ -213,10 +213,13 @@ void resetSoilHistory() {
 
 // Turns the relay on for `requestedMs`, clamped to Safety::MAX_PUMP_DURATION_MS
 // regardless of the caller (manual command or auto-irrigation).
-void TurnRelay(unsigned long requestedMs) {
+// Returns the actual duration applied, or 0 if the relay was already on
+// (request ignored) — callers use this to log what really happened,
+// not just what was requested.
+unsigned long TurnRelay(unsigned long requestedMs) {
   if (relayOn) {
     Serial.println("Pump is still on, ignoring new request.");
-    return;
+    return 0;
   }
 
   unsigned long safeMs = requestedMs;
@@ -230,6 +233,34 @@ void TurnRelay(unsigned long requestedMs) {
   digitalWrite(Pins::RELAY, HIGH);
   relayOn = true;
   relayStartTime = millis();
+  return safeMs;
+}
+
+// Melaporkan ke server bahwa penyiraman baru saja dimulai, untuk dicatat
+// sebagai riwayat timestamp di dashboard. Dipanggil dengan durasi AKTUAL
+// yang dikembalikan TurnRelay() (bukan yang diminta), supaya log yang
+// tercatat adalah eksekusi nyata, bukan sekadar niat.
+void reportWatering(unsigned long durationMs, const char* source) {
+  if (durationMs == 0) return; // relay tidak jadi menyala, tidak ada yang perlu dilaporkan
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  JsonDocument doc;
+  doc["duration"] = durationMs;
+  doc["source"]   = source;
+
+  char payload[128];
+  size_t len = serializeJson(doc, payload, sizeof(payload));
+
+  HTTPClient http;
+  http.begin(String(Pump_API_URL) + "/log"); // -> {Pump_API_URL}/log, misal http://host:3001/api/pump/log
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", DEVICE_API_KEY);
+  http.setConnectTimeout(3000);
+  http.setTimeout(3000);
+
+  int code = http.POST((uint8_t*)payload, len);
+  Serial.printf("Watering log reported (%s, %lums) | HTTP %d\n", source, durationMs, code);
+  http.end();
 }
 
 void readEnvironmentSensors() {
@@ -279,14 +310,15 @@ void handleSoilAndIrrigation() {
 
   if (consistentlyDry && !relayOn && !cooldownActive) {
     Serial.println("Soil is dry -> turning relay ON (auto-irrigation).");
-    TurnRelay(Interval::RELAY_ON);
+    unsigned long applied = TurnRelay(Interval::RELAY_ON);
+    reportWatering(applied, "auto");
 
     // Clear stale "dry" samples so the next few checks don't instantly
     // see a full-dry buffer again, and start the cooldown window.
     resetSoilHistory();
     irrigationCooldownUntil = millis() + Safety::IRRIGATION_COOLDOWN_MS;
   } else if (cooldownActive) {
-    Serial.println("Soil condition dry, but irrigation cooldown active — skipping.");
+    Serial.printf("Soil condition dry, skiping because irrigation cooldown active %d\n", (irrigationCooldownUntil - millis()) / 1000UL);
   } else {
     Serial.println("Soil condition normal.");
   }
@@ -328,6 +360,7 @@ void sendDataToServer() {
   HTTPClient http;
   http.begin(SERVER_URL);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("x-api-key", DEVICE_API_KEY);
   http.setConnectTimeout(3000);
   http.setTimeout(3000);
 
@@ -344,6 +377,7 @@ void checkPumpCommand() {
 
   HTTPClient http;
   http.begin(Pump_API_URL);
+  http.addHeader("x-api-key", DEVICE_API_KEY);
   http.setConnectTimeout(3000);
   http.setTimeout(3000);
 
@@ -361,7 +395,8 @@ void checkPumpCommand() {
     } else if (doc["active"] == true) {
       unsigned long duration = doc["duration"] | 0UL;
       Serial.printf("Server command: water for %lu ms\n", duration);
-      TurnRelay(duration); // TurnRelay() itself enforces MAX_PUMP_DURATION_MS
+      unsigned long applied = TurnRelay(duration); // TurnRelay() itself enforces MAX_PUMP_DURATION_MS
+      reportWatering(applied, "manual");
     }
   } else {
     Serial.printf("HTTP error: %d\n", httpCode);
@@ -437,8 +472,12 @@ void setup() {
 
   // Watchdog: if loop() stops feeding it for WDT_TIMEOUT_S seconds, the
   // chip resets itself instead of hanging forever unattended.
+  // Using the pre-3.x core API (uint32_t seconds, bool panic) since the
+  // struct-based esp_task_wdt_config_t API is only available on core 3.x
+  // (IDF 5.x). If you upgrade the ESP32 board package to 3.x later, this
+  // can be switched back to the config-struct form.
   esp_task_wdt_init(Safety::WDT_TIMEOUT_S, true);
-esp_task_wdt_add(NULL);
+  esp_task_wdt_add(NULL);
 
   bootTime = millis();
 
